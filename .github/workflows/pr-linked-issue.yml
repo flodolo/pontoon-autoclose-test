@@ -1,0 +1,105 @@
+name: Autoclose PRs without linked issue
+
+# pull_request_target is needed so that the workflow can comment on and close
+# PRs from forks. It runs in the context of the base branch: never check out or
+# execute code from the PR, and only pass PR data to scripts via env variables.
+on:
+  pull_request_target:
+    types: [opened, edited, reopened]
+
+permissions: {}
+
+concurrency:
+  group: pr-linked-issue-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Require a linked, assigned issue
+    if: >-
+      github.repository == 'flodolo/pontoon-autoclose-test' &&
+      github.event.pull_request.state == 'open' &&
+      github.event.pull_request.user.login != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: write
+    steps:
+      - name: Check for a linked issue assigned to the PR author
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          set -euo pipefail
+
+          # The permission endpoint reports "read" for anyone on a public repo,
+          # so check collaborator status directly (204 if collaborator, 404 if not).
+          if OUTPUT=$(gh api "repos/$REPO/collaborators/$PR_AUTHOR" --silent 2>&1); then
+            echo "$PR_AUTHOR is a collaborator, skipping check."
+            exit 0
+          elif ! grep -q "HTTP 404" <<< "$OUTPUT"; then
+            echo "::error::Failed to check collaborator status: $OUTPUT"
+            exit 1
+          fi
+
+          # Linked issues may not be available immediately after a PR is opened or
+          # edited, so retry before closing.
+          for ATTEMPT in 1 2 3; do
+            # closingIssuesReferences covers closing keywords in the description and
+            # issues linked manually from the PR sidebar.
+            ISSUES=$(gh api graphql \
+              -F owner="${REPO%/*}" -F name="${REPO#*/}" -F number="$PR_NUMBER" \
+              -f query='
+                query($owner: String!, $name: String!, $number: Int!) {
+                  repository(owner: $owner, name: $name) {
+                    pullRequest(number: $number) {
+                      closingIssuesReferences(first: 25) {
+                        nodes {
+                          number
+                          repository { nameWithOwner }
+                          assignees(first: 25) { nodes { login } }
+                        }
+                      }
+                    }
+                  }
+                }' \
+              --jq '.data.repository.pullRequest.closingIssuesReferences.nodes')
+
+            echo "Linked issues: $(jq -c '[.[] | "\(.repository.nameWithOwner)#\(.number)"]' <<< "$ISSUES")"
+
+            MATCH=$(jq -r --arg repo "$REPO" --arg author "$PR_AUTHOR" '
+              [.[] | select(
+                (.repository.nameWithOwner | ascii_downcase) == ($repo | ascii_downcase)
+                and any(.assignees.nodes[]; .login == $author)
+              ) | .number] | first // empty' <<< "$ISSUES")
+
+            if [ -n "$MATCH" ]; then
+              echo "Found issue #$MATCH assigned to $PR_AUTHOR."
+              exit 0
+            fi
+
+            if [ "$ATTEMPT" -lt 3 ]; then
+              echo "No match on attempt $ATTEMPT, retrying in 15 seconds."
+              sleep 15
+            fi
+          done
+
+          echo "No linked issue assigned to $PR_AUTHOR, closing PR #$PR_NUMBER."
+          COMMENT_FILE=$(mktemp)
+          cat > "$COMMENT_FILE" <<EOF
+          Hi @$PR_AUTHOR, thanks for your interest in contributing to Pontoon!
+
+          This pull request is being closed automatically because it is not linked to an issue assigned to you. To avoid duplicated or unwanted work, all external contributions need to be tied to an issue that a maintainer has assigned to you.
+
+          To contribute:
+
+          1. Find an existing issue (or file a new one) and ask in a comment to be assigned to it.
+          2. Once you've been assigned, open a pull request that includes a closing keyword referencing the issue in its description, e.g. \`Fixes #123\`.
+
+          See the [guide to your first contribution](https://pontoon.mozilla.org/docs/dev/first-contribution/) for more information.
+          EOF
+          gh pr close "$PR_NUMBER" --comment "$(cat "$COMMENT_FILE")"
